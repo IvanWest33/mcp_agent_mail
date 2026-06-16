@@ -201,6 +201,8 @@ class Settings:
     file_reservations_cleanup_interval_seconds: int
     file_reservation_inactivity_seconds: int
     file_reservation_activity_grace_seconds: int
+    file_reservations_released_retention_seconds: int
+    file_reservations_purge_batch_size: int
     # Server-side enforcement
     file_reservations_enforcement_enabled: bool
     # Ack TTL warnings
@@ -460,6 +462,8 @@ def _build_settings() -> Settings:
         file_reservations_cleanup_interval_seconds=_int(decouple_config("FILE_RESERVATIONS_CLEANUP_INTERVAL_SECONDS", default="60"), default=60),
         file_reservation_inactivity_seconds=_int(decouple_config("FILE_RESERVATION_INACTIVITY_SECONDS", default="1800"), default=1800),
         file_reservation_activity_grace_seconds=_int(decouple_config("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", default="900"), default=900),
+        file_reservations_released_retention_seconds=_int(decouple_config("FILE_RESERVATIONS_RELEASED_RETENTION_SECONDS", default="604800"), default=604800),
+        file_reservations_purge_batch_size=_int(decouple_config("FILE_RESERVATIONS_PURGE_BATCH_SIZE", default="5000"), default=5000),
         file_reservations_enforcement_enabled=_bool(decouple_config("FILE_RESERVATIONS_ENFORCEMENT_ENABLED", default="true"), default=True),
         ack_ttl_enabled=_bool(decouple_config("ACK_TTL_ENABLED", default="false"), default=False),
         ack_ttl_seconds=_int(decouple_config("ACK_TTL_SECONDS", default="1800"), default=1800),

@@ -31,6 +31,7 @@ from starlette.types import Receive, Scope, Send
 from .app import (
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
+    _purge_released_file_reservations,
     _sender_display_name,
     _tool_metrics_snapshot,
     build_mcp_server,
@@ -957,6 +958,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         with contextlib.suppress(Exception):
                             stale = await _expire_stale_file_reservations(pid)
                             released_total += len(stale)
+                    purge_result = {"deleted": 0, "remaining_candidates": 0}
+                    with contextlib.suppress(Exception):
+                        purge_result = await _purge_released_file_reservations()
+                    purged_total = int(purge_result.get("deleted") or 0)
+                    remaining_purge_candidates = int(purge_result.get("remaining_candidates") or 0)
                     try:
                         rich_console = importlib.import_module("rich.console")
                         rich_panel = importlib.import_module("rich.panel")
@@ -964,7 +970,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         Panel = rich_panel.Panel
                         Console().print(
                             Panel.fit(
-                                f"projects_scanned={len(pids)} released={released_total}",
+                                f"projects_scanned={len(pids)} released={released_total} purged={purged_total} remaining_purge_candidates={remaining_purge_candidates}",
                                 title="File Reservations Cleanup",
                                 border_style="cyan",
                             )
@@ -976,6 +982,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             "file_reservations_cleanup",
                             projects_scanned=len(pids),
                             stale_released=released_total,
+                            released_purged=purged_total,
+                            remaining_purge_candidates=remaining_purge_candidates,
                         )
                 except Exception:
                     pass

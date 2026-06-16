@@ -50,6 +50,7 @@ from .app import (
     _canonicalize_project_identifier,
     _extract_like_terms,
     _like_escape,
+    _purge_released_file_reservations,
     _sanitize_fts_query,
     _sender_display_name,
     build_mcp_server,
@@ -3857,6 +3858,37 @@ def file_reservations_list(
             _iso(file_reservation.released_ts) if file_reservation.released_ts else "",
         )
     console.print(table)
+
+
+@file_reservations_app.command("purge-released")
+def file_reservations_purge_released(
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Project slug or human key. Omit to purge all projects."),
+    max_age_seconds: Optional[int] = typer.Option(None, "--max-age-seconds", help="Override released-row retention in seconds."),
+    batch_size: Optional[int] = typer.Option(None, "--batch-size", help="Maximum rows to delete in one run."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; pass --apply to delete rows."),
+) -> None:
+    """Purge released file_reservations that are older than the retention window."""
+
+    async def _run() -> dict[str, Any]:
+        project_id: int | None = None
+        if project:
+            project_record = await _get_project_record(project)
+            if project_record.id is None:
+                raise ValueError("Project must have an id")
+            project_id = project_record.id
+        return await _purge_released_file_reservations(
+            project_id,
+            max_age_seconds=max_age_seconds,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+
+    try:
+        result = _run_async(_run())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print_json(data=result)
+
 
 @amctl_app.command("env")
 def amctl_env(

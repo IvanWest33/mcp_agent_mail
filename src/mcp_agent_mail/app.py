@@ -4038,6 +4038,67 @@ async def _expire_stale_file_reservations(
     return stale_statuses
 
 
+async def _purge_released_file_reservations(
+    project_id: int | None = None,
+    *,
+    max_age_seconds: int | None = None,
+    batch_size: int | None = None,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Delete old released file reservation rows without loading them into memory."""
+    await ensure_schema()
+    settings = get_settings()
+    retention_seconds = int(
+        settings.file_reservations_released_retention_seconds
+        if max_age_seconds is None
+        else max_age_seconds
+    )
+    retention_seconds = max(0, retention_seconds)
+    limit = int(settings.file_reservations_purge_batch_size if batch_size is None else batch_size)
+    limit = max(1, limit)
+    now_utc = now or datetime.now(timezone.utc)
+    cutoff = _naive_utc(now_utc) - timedelta(seconds=retention_seconds)
+
+    conditions: list[Any] = [
+        cast(Any, FileReservation.released_ts).is_not(None),
+        cast(Any, FileReservation.released_ts) < cutoff,
+    ]
+    if project_id is not None:
+        conditions.append(cast(Any, FileReservation.project_id) == project_id)
+
+    async with get_immediate_session() as session:
+        count_result = await session.execute(
+            select(func.count()).select_from(FileReservation).where(and_(*conditions))
+        )
+        candidates = int(count_result.scalar() or 0)
+        id_rows = await session.execute(
+            select(FileReservation.id)
+            .where(and_(*conditions))
+            .order_by(asc(cast(Any, FileReservation.released_ts)), asc(cast(Any, FileReservation.id)))
+            .limit(limit)
+        )
+        candidate_ids = [int(row[0]) for row in id_rows.all() if row[0] is not None]
+        deleted = 0
+        if not dry_run and candidate_ids:
+            await session.execute(
+                delete(FileReservation).where(cast(Any, FileReservation.id).in_(candidate_ids))
+            )
+            await session.commit()
+            deleted = len(candidate_ids)
+
+    return {
+        "status": "dry_run" if dry_run else "purged",
+        "deleted": deleted,
+        "candidates": candidates,
+        "remaining_candidates": max(candidates - deleted, 0),
+        "batch_size": limit,
+        "cutoff_date": cutoff.isoformat(),
+        "max_age_seconds": retention_seconds,
+        "project_id": project_id,
+    }
+
+
 def _file_reservations_conflict(existing: FileReservation, candidate_path: str, candidate_exclusive: bool, candidate_agent: Agent) -> bool:
     if existing.released_ts is not None:
         return False
@@ -7949,6 +8010,46 @@ def build_mcp_server() -> FastMCP:
             "cutoff_date": cutoff.isoformat(),
             "max_age_days": age_limit,
         }
+
+    @mcp.tool(
+        name="purge_released_file_reservations",
+        description="Delete released file_reservations older than the configured retention window. "
+        "Defaults to FILE_RESERVATIONS_RELEASED_RETENTION_SECONDS and dry-run mode.",
+    )
+    @_instrument_tool(
+        "purge_released_file_reservations",
+        cluster=CLUSTER_FILE_RESERVATIONS,
+        capabilities={"file_reservations", "write"},
+    )
+    async def purge_released_file_reservations(
+        ctx: Context,
+        project_key: Optional[str] = None,
+        max_age_seconds: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Purge released file reservation history in bounded batches."""
+        project_id: int | None = None
+        project_label = project_key or "*"
+        if project_key:
+            project = await _get_project_by_identifier(project_key)
+            if not project:
+                raise ValueError(f"Project '{project_key}' not found")
+            project_id = project.id
+            project_label = project.human_key or project.slug or project_key
+        result = await _purge_released_file_reservations(
+            project_id,
+            max_age_seconds=max_age_seconds,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+        status = result["status"]
+        await ctx.info(
+            "purge_released_file_reservations: "
+            f"{status}, deleted={result['deleted']} candidates={result['candidates']} "
+            f"project={project_label} cutoff={result['cutoff_date']}"
+        )
+        return result
 
     @mcp.tool(name="reply_message")
     @_instrument_tool(
@@ -12607,6 +12708,15 @@ def build_mcp_server() -> FastMCP:
                         "expected_frequency": "Periodically during multi-hour work items.",
                         "required_capabilities": ["file_reservations"],
                         "usage_examples": [{"hint": "Extend", "sample": "renew_file_reservations(project_key='backend', agent_name='BlueLake', extend_seconds=1800)"}],
+                    },
+                    {
+                        "name": "purge_released_file_reservations",
+                        "summary": "Delete old released file_reservation rows in bounded batches.",
+                        "use_when": "Maintenance or recovery after reservation history has grown too large.",
+                        "related": ["file_reservation_paths", "release_file_reservations"],
+                        "expected_frequency": "Background service sweep; manual use only for repair.",
+                        "required_capabilities": ["file_reservations", "write"],
+                        "usage_examples": [{"hint": "Dry-run cleanup", "sample": "purge_released_file_reservations(project_key='backend', max_age_seconds=604800, dry_run=true)"}],
                     },
                 ],
             },
