@@ -3833,6 +3833,34 @@ async def _create_message(
     return message
 
 
+async def _touch_agent_activity(agent: Agent) -> None:
+    """Record that `agent` is alive, the way sending mail already does.
+
+    Reserving and renewing files are the only long-running signals an agent
+    can emit without ever sending a message, yet neither used to update
+    `last_active_ts`. `_collect_file_reservation_statuses` marks an agent
+    whose `last_active_ts` is older than `file_reservation_inactivity_seconds`
+    as inactive, and `_expire_stale_file_reservations` then releases that
+    agent's reservations *regardless of TTL* — the stale branch has no
+    `expires_ts` predicate. So a lock-only agent lost every reservation it
+    held once it crossed the inactivity threshold, and because the sweep runs
+    inside `file_reservations_resource`, the release happened during an
+    ordinary read: callers observed reserve-succeeds, list-returns-nothing,
+    release-finds-nothing, with the rows released seconds after creation and
+    an hour of TTL still on them.
+    """
+    if agent.id is None:
+        return
+    now = _naive_utc()
+    await ensure_schema()
+    async with get_immediate_session() as session:
+        await session.execute(
+            update(Agent).where(cast(Any, Agent.id) == agent.id).values(last_active_ts=now)
+        )
+        await session.commit()
+    agent.last_active_ts = now
+
+
 async def _create_file_reservation(
     project: Project,
     agent: Agent,
@@ -3855,8 +3883,14 @@ async def _create_file_reservation(
             expires_ts=expires,
         )
         session.add(file_reservation)
+        # Same transaction as the insert: a reservation and the activity it
+        # implies must never be able to diverge.
+        await session.execute(
+            update(Agent).where(cast(Any, Agent.id) == agent.id).values(last_active_ts=_naive_utc())
+        )
         await session.commit()
         await session.refresh(file_reservation)
+        agent.last_active_ts = _naive_utc()
     return file_reservation
 
 
@@ -11314,6 +11348,11 @@ def build_mcp_server() -> FastMCP:
         )
         if project.id is None:
             raise ValueError("Project must have an id before reserving file paths.")
+        # Before the sweep, not after: an agent calling this tool is by
+        # definition active, and the sweep below would otherwise release the
+        # reservations it already holds on the strength of a `last_active_ts`
+        # this very call disproves.
+        await _touch_agent_activity(agent)
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
         if stale_auto_releases:
             summary = ", ".join(
@@ -11964,6 +12003,9 @@ def build_mcp_server() -> FastMCP:
         await ensure_schema()
         now = datetime.now(timezone.utc)
         bump = max(60, int(extend_seconds))
+        # See file_reservation_paths: renewing is activity, and the sweep must
+        # not release the very reservations this call is here to extend.
+        await _touch_agent_activity(agent)
         stale_auto_releases = await _expire_stale_file_reservations(project.id)
         if stale_auto_releases:
             summary = ", ".join(

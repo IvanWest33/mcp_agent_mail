@@ -32,7 +32,7 @@ import pytest
 from fastmcp import Client
 from sqlalchemy import text
 
-from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.app import _expire_stale_file_reservations, build_mcp_server
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.storage import ensure_archive
@@ -1191,3 +1191,172 @@ async def test_file_reservation_rolls_back_db_row_when_archive_write_fails(isola
                 )
             ).scalar() or 0
         assert count == 0, "orphaned file_reservation row left after archive write failure (#180)"
+
+
+# ============================================================================
+# Test: reserving and renewing count as agent activity
+# ============================================================================
+
+
+async def _set_agent_last_active(agent_id: int, moment: datetime) -> None:
+    """Backdate an agent's activity clock (naive UTC, as the schema stores it)."""
+    async with get_session() as session:
+        await session.execute(
+            text("UPDATE agents SET last_active_ts = :ts WHERE id = :id"),
+            {"ts": moment.replace(tzinfo=None), "id": agent_id},
+        )
+        await session.commit()
+
+
+async def _get_agent_last_active(agent_id: int) -> datetime | None:
+    async with get_session() as session:
+        result = await session.execute(
+            text("SELECT last_active_ts FROM agents WHERE id = :id"),
+            {"id": agent_id},
+        )
+        row = result.first()
+    if row is None or row[0] is None:
+        return None
+    value = row[0]
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    return value
+
+
+@pytest.mark.asyncio
+async def test_reserving_refreshes_agent_activity(isolated_env):
+    """Reserving a path counts as activity.
+
+    Regression: `_create_file_reservation` never touched `last_active_ts`, so an
+    agent that only ever held locks — and sent no mail — kept the activity clock
+    it was born with, no matter how much work it was visibly doing.
+    """
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client, "/test/res/activity-refresh"
+        )
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        agent_id = await get_agent_id(project_id, agent_name)
+        assert agent_id is not None
+
+        long_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        await _set_agent_last_active(agent_id, long_ago)
+        assert (await _get_agent_last_active(agent_id)) is not None
+
+        await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+                "reason": "Reserving is activity",
+            },
+        )
+
+        refreshed = await _get_agent_last_active(agent_id)
+        assert refreshed is not None
+        assert refreshed.replace(tzinfo=timezone.utc) > long_ago + timedelta(days=6), (
+            "reserving a path must refresh last_active_ts"
+        )
+
+
+@pytest.mark.asyncio
+async def test_live_reservation_survives_stale_sweep_for_lock_only_agent(isolated_env):
+    """A lock-only agent must not have its own un-expired reservations swept.
+
+    Observed in the wild: an agent whose `last_active_ts` was days old — because
+    reserving never refreshed it — had all five of its reservations released
+    ~12 seconds after creation with an hour of TTL still on them. The release
+    came from `_expire_stale_file_reservations`, whose stale branch carries no
+    `expires_ts` predicate and which runs *inside* the ordinary read path. The
+    symptom chain was: reserve succeeds, list returns count 0, release finds
+    nothing to release.
+    """
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client, "/test/res/lock-only-agent"
+        )
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        agent_id = await get_agent_id(project_id, agent_name)
+        assert agent_id is not None
+
+        # Well past file_reservation_inactivity_seconds (default 1800).
+        await _set_agent_last_active(agent_id, datetime.now(timezone.utc) - timedelta(days=7))
+
+        result = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+                "reason": "Held by an agent that only ever locks",
+            },
+        )
+        reservation_id = result.data["granted"][0]["id"]
+
+        # The sweep every read of this project performs.
+        await _expire_stale_file_reservations(project_id)
+
+        reservation = await get_file_reservation_from_db(reservation_id)
+        assert reservation is not None
+        assert reservation["released_ts"] is None, (
+            "stale sweep released a live reservation with ~1h of TTL remaining"
+        )
+        assert await count_active_reservations(project_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_renewing_refreshes_agent_activity(isolated_env):
+    """Renewing counts as activity too, and must not sweep what it is extending."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project_key, agent_name = await setup_project_and_agent(
+            client, "/test/res/renew-activity"
+        )
+        project_id = await get_project_id(project_key)
+        assert project_id is not None
+        agent_id = await get_agent_id(project_id, agent_name)
+        assert agent_id is not None
+
+        result = await client.call_tool(
+            "file_reservation_paths",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "paths": ["src/**"],
+                "ttl_seconds": 3600,
+                "exclusive": True,
+            },
+        )
+        reservation_id = result.data["granted"][0]["id"]
+
+        long_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        await _set_agent_last_active(agent_id, long_ago)
+
+        renewed = await client.call_tool(
+            "renew_file_reservations",
+            {
+                "project_key": project_key,
+                "agent_name": agent_name,
+                "extend_seconds": 3600,
+            },
+        )
+        assert renewed.data["renewed"] == 1, (
+            "renew swept the reservation it was called to extend"
+        )
+
+        refreshed = await _get_agent_last_active(agent_id)
+        assert refreshed is not None
+        assert refreshed.replace(tzinfo=timezone.utc) > long_ago + timedelta(days=6)
+
+        reservation = await get_file_reservation_from_db(reservation_id)
+        assert reservation is not None
+        assert reservation["released_ts"] is None
