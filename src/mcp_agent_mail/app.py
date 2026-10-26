@@ -11142,9 +11142,7 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"Issued {len(granted)} file_reservations for '{agent.name}'. Conflicts: {len(conflicts)}")
         return {"granted": granted, "conflicts": conflicts}
 
-    @mcp.tool(name="release_file_reservations")
-    @_instrument_tool("release_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
-    async def release_file_reservations_tool(
+    async def _release_file_reservations(
         ctx: Context,
         project_key: str,
         agent_name: str,
@@ -11152,6 +11150,7 @@ def build_mcp_server() -> FastMCP:
         file_reservation_ids: Optional[list[int]] = None,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Release active file reservations held by an agent.
@@ -11250,6 +11249,10 @@ def build_mcp_server() -> FastMCP:
                     select_stmt = select_stmt.where(cast(Any, FileReservation.id).in_(file_reservation_ids))
                 if paths:
                     select_stmt = select_stmt.where(cast(Any, FileReservation.path_pattern).in_(paths))
+                if task_id is not None:
+                    # Select and release under the same write transaction: a
+                    # reservation ID can be reused with a different task reason.
+                    select_stmt = select_stmt.where(cast(Any, FileReservation.reason) == task_id)
                 result = await session.execute(select_stmt)
                 reservations = list(result.scalars().all())
                 if reservations:
@@ -11288,6 +11291,54 @@ def build_mcp_server() -> FastMCP:
                 except Exception:
                     pass
             raise
+
+    @mcp.tool(name="release_file_reservations")
+    @_instrument_tool("release_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
+    async def release_file_reservations_tool(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        paths: Optional[list[str]] = None,
+        file_reservation_ids: Optional[list[int]] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Release an agent's active reservations, restricted by paths/IDs if supplied.
+
+        Omitting both selectors releases all active reservations for the agent.
+        Empty selectors are rejected. Already released IDs are a no-op.
+        Returns {released: int, released_at: iso8601}; audit records are retained.
+        For task cleanup, use release_task_file_reservations instead.
+        """
+        return await _release_file_reservations(
+            ctx, project_key, agent_name, paths, file_reservation_ids, registration_token, format,
+        )
+
+    @mcp.tool(name="release_task_file_reservations")
+    @_instrument_tool("release_task_file_reservations", cluster=CLUSTER_FILE_RESERVATIONS, capabilities={"file_reservations"}, project_arg="project_key", agent_arg="agent_name")
+    async def release_task_file_reservations_tool(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        task_id: str,
+        paths: Optional[list[str]] = None,
+        file_reservation_ids: Optional[list[int]] = None,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically release only this agent's reservations with reason exactly task_id.
+
+        Optional paths/IDs further restrict the task scope. No matching reservations
+        is a successful no-op; a blank task ID is rejected. Returns released count/time.
+        A distinct tool name prevents old servers from silently ignoring task scope.
+        """
+        if not task_id.strip():
+            raise ToolExecutionError(
+                error_type="EMPTY_TASK_ID", message="task_id must not be blank", recoverable=True,
+            )
+        return await _release_file_reservations(
+            ctx, project_key, agent_name, paths, file_reservation_ids, registration_token, format, task_id,
+        )
 
     @mcp.tool(name="force_release_file_reservation")
     @_instrument_tool(
@@ -12699,6 +12750,15 @@ def build_mcp_server() -> FastMCP:
                         "expected_frequency": "Each time work on a surface completes.",
                         "required_capabilities": ["file_reservations"],
                         "usage_examples": [{"hint": "Unlock", "sample": "release_file_reservations(project_key='backend', agent_name='BlueLake', paths=['src/app.py'])"}],
+                    },
+                    {
+                        "name": "release_task_file_reservations",
+                        "summary": "Release only reservations whose current reason exactly matches the task ID.",
+                        "use_when": "Finishing one task while other tasks share the same agent identity.",
+                        "related": ["file_reservation_paths", "release_file_reservations"],
+                        "expected_frequency": "Each time a task completes.",
+                        "required_capabilities": ["file_reservations"],
+                        "usage_examples": [{"hint": "Unlock task", "sample": "release_task_file_reservations(project_key='backend', agent_name='BlueLake', task_id='bd-123')"}],
                     },
                     {
                         "name": "renew_file_reservations",
