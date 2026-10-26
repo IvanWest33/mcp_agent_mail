@@ -598,6 +598,71 @@ async def test_manual_release_before_ttl(isolated_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selector", ["all", "paths", "ids"])
+async def test_task_release_preserves_other_tasks(isolated_env, selector):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project, agent = await setup_project_and_agent(client, "/test/res/task_release")
+        ids = []
+        for path, reason in [("a.py", "bd-a"), ("b.py", "bd-b"), ("prefix.py", "bd-a-other")]:
+            result = await client.call_tool("file_reservation_paths", {
+                "project_key": project, "agent_name": agent,
+                "paths": [path], "reason": reason,
+            })
+            ids.append(result.data["granted"][0]["id"])
+        args = {"project_key": project, "agent_name": agent, "task_id": "bd-a"}
+        # Even explicitly selecting another task's paths/IDs cannot broaden scope.
+        if selector == "paths":
+            args["paths"] = ["a.py", "b.py", "prefix.py"]
+        elif selector == "ids":
+            args["file_reservation_ids"] = ids
+        result = await client.call_tool("release_task_file_reservations", args)
+        assert result.data["released"] == 1
+        for index, reservation_id in enumerate(ids):
+            row = await get_file_reservation_from_db(reservation_id)
+            assert (row["released_ts"] is not None) == (index == 0)
+        again = await client.call_tool("release_task_file_reservations", args)
+        assert again.data["released"] == 0
+
+
+@pytest.mark.asyncio
+async def test_task_release_checks_current_owner_not_a_stale_id(isolated_env):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project, agent = await setup_project_and_agent(client, "/test/res/task_transfer")
+        args = {"project_key": project, "agent_name": agent, "paths": ["shared.py"]}
+        first = await client.call_tool("file_reservation_paths", {**args, "reason": "bd-old"})
+        reservation_id = first.data["granted"][0]["id"]
+        second = await client.call_tool("file_reservation_paths", {**args, "reason": "bd-new"})
+        assert second.data["granted"][0]["id"] == reservation_id
+        result = await client.call_tool("release_task_file_reservations", {
+            "project_key": project, "agent_name": agent, "task_id": "bd-old",
+            "file_reservation_ids": [reservation_id],
+        })
+        assert result.data["released"] == 0
+        row = await get_file_reservation_from_db(reservation_id)
+        assert row["reason"] == "bd-new"
+        assert row["released_ts"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_id", ["", "   "])
+async def test_task_release_rejects_blank_scope(isolated_env, task_id):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        project, agent = await setup_project_and_agent(client, "/test/res/task_blank")
+        result = await client.call_tool("file_reservation_paths", {
+            "project_key": project, "agent_name": agent, "paths": ["keep.py"], "reason": "bd-keep",
+        })
+        reservation_id = result.data["granted"][0]["id"]
+        with pytest.raises(Exception, match="task_id must not be blank"):
+            await client.call_tool("release_task_file_reservations", {
+                "project_key": project, "agent_name": agent, "task_id": task_id,
+            })
+        assert (await get_file_reservation_from_db(reservation_id))["released_ts"] is None
+
+
+@pytest.mark.asyncio
 async def test_release_expired_reservation_is_noop(isolated_env):
     """Manual release should ignore reservations whose TTL already elapsed."""
     server = build_mcp_server()
